@@ -59,6 +59,7 @@ pub struct Input<C: openxr_data::Compositor> {
     subaction_paths: SubactionPaths,
     events: Mutex<VecDeque<InputEvent>>,
     loading_actions: AtomicBool,
+    headless: bool,
 }
 
 struct InputEvent {
@@ -113,6 +114,7 @@ impl<C: openxr_data::Compositor> Input<C> {
             .pose_data
             .set(pose_data)
             .unwrap_or_else(|_| panic!("PoseData already setup"));
+        let headless = openxr.headless;
 
         Self {
             openxr,
@@ -132,6 +134,7 @@ impl<C: openxr_data::Compositor> Input<C> {
             subaction_paths,
             events: Mutex::default(),
             loading_actions: false.into(),
+            headless,
         }
     }
 

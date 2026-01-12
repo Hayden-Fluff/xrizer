@@ -168,9 +168,11 @@ impl IVRClientCore003_Interface for ClientCore {
             return vr::EVRInitError::None;
         }
 
+        let headless = application_type == vr::EVRApplicationType::Background;
+
         match OpenXrData::new(&Injector {
             store: self.interface_store.clone(),
-        }) {
+        }, headless) {
             Ok(data) => {
                 let data = Arc::new(data);
                 if let Some(path) = manifest_path {

@@ -1,12 +1,12 @@
 use crate::{
     clientcore::{Injected, Injector},
-    graphics_backends::{supported_apis_enum, GraphicsBackend, VulkanData},
+    graphics_backends::{GraphicsBackend, VulkanData, supported_apis_enum},
 };
 use derive_more::Deref;
 use glam::f32::{Quat, Vec3};
-use log::{info, warn};
+use log::{info, warn, error};
 use openvr as vr;
-use openxr as xr;
+use openxr::{self as xr, Time};
 use std::mem::ManuallyDrop;
 use std::sync::{
     atomic::{AtomicI64, Ordering},
@@ -41,6 +41,7 @@ pub struct OpenXrData<C: Compositor> {
     pub session_data: SessionReadGuard,
     pub display_time: AtomicXrTime,
     pub enabled_extensions: xr::ExtensionSet,
+    pub headless: bool,
 
     /// should only be externally accessed for testing
     pub(crate) input: Injected<crate::input::Input<C>>,
@@ -104,7 +105,7 @@ fn make_version() -> u32 {
 }
 
 impl<C: Compositor> OpenXrData<C> {
-    pub fn new(injector: &Injector) -> Result<Self, InitError> {
+    pub fn new(injector: &Injector, headless: bool) -> Result<Self, InitError> {
         #[cfg(not(test))]
         let entry = xr::Entry::linked();
 
@@ -116,7 +117,16 @@ impl<C: Compositor> OpenXrData<C> {
         let supported_exts = entry
             .enumerate_extensions()
             .map_err(InitError::EnumeratingExtensionsFailed)?;
+
+        if headless && (!supported_exts.mnd_headless || !supported_exts.khr_convert_timespec_time) {
+            error!("Headles extension not supported!");
+        }
+
         let mut exts = xr::ExtensionSet::default();
+        if headless && supported_exts.mnd_headless {
+            exts.mnd_headless = supported_exts.mnd_headless;
+            exts.khr_convert_timespec_time = supported_exts.khr_convert_timespec_time;
+        }
         exts.khr_vulkan_enable = supported_exts.khr_vulkan_enable;
         exts.khr_opengl_enable = supported_exts.khr_opengl_enable;
         exts.ext_hand_tracking = supported_exts.ext_hand_tracking;
@@ -161,6 +171,7 @@ impl<C: Compositor> OpenXrData<C> {
                 system_id,
                 vr::ETrackingUniverseOrigin::Standing,
                 None,
+                headless,
             )?
             .0,
         )));
@@ -172,6 +183,7 @@ impl<C: Compositor> OpenXrData<C> {
             session_data,
             display_time: AtomicXrTime(1.into()),
             enabled_extensions: exts,
+            headless,
             input: injector.inject(),
             compositor: injector.inject(),
         })
@@ -224,7 +236,7 @@ impl<C: Compositor> OpenXrData<C> {
         let _ = unsafe { ManuallyDrop::take(&mut *session_guard) };
 
         let (session, waiter, stream) =
-            SessionData::new(&self.instance, self.system_id, origin, Some(&info))
+            SessionData::new(&self.instance, self.system_id, origin, Some(&info), self.headless)
                 .expect("Failed to initalize new session");
 
         comp.post_session_restart(&session, waiter, stream);
@@ -244,6 +256,14 @@ impl<C: Compositor> OpenXrData<C> {
         self.session_data.get().current_origin
     }
 
+    pub fn get_display_time(&self) -> Time {
+        if self.headless {
+            self.instance.now().unwrap()
+        } else {
+            self.get_display_time()
+        }
+    }
+
     pub fn reset_tracking_space(&self, origin: vr::ETrackingUniverseOrigin) {
         let mut guard = self.session_data.0.write().unwrap();
         let SessionData {
@@ -261,7 +281,7 @@ impl<C: Compositor> OpenXrData<C> {
                 position,
                 orientation,
             } = view_space
-                .locate(ref_space, self.display_time.get())
+                .locate(ref_space, self.get_display_time())
                 .unwrap()
                 .pose;
 
@@ -358,6 +378,7 @@ impl std::fmt::Display for GraphicalSession {
         match self {
             GraphicalSession::Vulkan(_) => f.write_str("GraphicalSession::Vulkan"),
             GraphicalSession::OpenGL(_) => f.write_str("GraphicalSession::OpenGL"),
+            GraphicalSession::Headless(_) => f.write_str("GraphicalSession::Headless"),
             #[cfg(test)]
             GraphicalSession::Fake(_) => f.write_str("GraphicalSession::Fake"),
         }
@@ -425,9 +446,13 @@ impl SessionData {
         system_id: xr::SystemId,
         current_origin: vr::ETrackingUniverseOrigin,
         create_info: Option<&SessionCreateInfo>,
+        headless: bool,
     ) -> Result<(Self, xr::FrameWaiter, FrameStream), SessionCreationError> {
         let info;
-        let (temp_vulkan, info) = if let Some(info) = create_info {
+        let (temp_vulkan, info) = if headless {
+            info = SessionCreateInfo::Headless(CreateInfo(xr::headless::SessionCreateInfo { }));
+            (None, &info)
+        } else if let Some(info) = create_info {
             if let SessionCreateInfo::Vulkan(info) = info {
                 // Monado seems to (incorrectly) give validation errors unless we call this.
                 let pd =
@@ -563,9 +588,9 @@ impl SessionData {
     pub fn check_format<G: GraphicsBackend>(&self, info: &mut xr::SwapchainCreateInfo<G::Api>)
     where
         for<'a> &'a GraphicalSession: TryInto<&'a Session<G::Api>, Error: std::fmt::Display>,
-        <G::Api as xr::Graphics>::Format: PartialEq,
+        G::Format: PartialEq,
     {
-        let formats = &(&self.session_graphics)
+        let formats: Vec<G::Format> = (&self.session_graphics)
             .try_into()
             .unwrap_or_else(|_| {
                 panic!(
@@ -574,16 +599,20 @@ impl SessionData {
                     self.session_graphics,
                 )
             })
-            .swapchain_formats;
+            .swapchain_formats
+            .clone()
+            .into_iter()
+            .map(G::from_openxr_format)
+            .collect();
 
-        if !formats.contains(&info.format) {
+        if !formats.contains(&G::from_openxr_format(info.format)) {
             let new_format = formats[0];
             warn!(
                 "Requested to init swapchain with unsupported format {:?} - instead using {:?}",
-                G::to_nice_format(info.format),
+                G::to_nice_format(G::from_openxr_format(info.format)),
                 G::to_nice_format(new_format)
             );
-            info.format = new_format;
+            info.format = G::to_openxr_format(new_format);
         }
     }
 
@@ -756,7 +785,7 @@ mod tests {
     #[test]
     fn session_restart_contended() {
         crate::init_logging();
-        let data = Arc::new(OpenXrData::<FakeCompositor>::new(&Injector::default()).unwrap());
+        let data = Arc::new(OpenXrData::<FakeCompositor>::new(&Injector::default(), false).unwrap());
         let barrier = Arc::new(std::sync::Barrier::new(2));
         let comp = Arc::new(FakeCompositor::new_with_barrier(
             &data,

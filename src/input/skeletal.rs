@@ -26,7 +26,7 @@ impl<C: openxr_data::Compositor> Input<C> {
         use HandSkeletonBone::*;
 
         let pose_data = session_data.input_data.pose_data.get().unwrap();
-        let display_time = self.openxr.display_time.get();
+        let display_time = self.openxr.get_display_time();
         let devices = session_data.input_data.devices.read().unwrap();
 
         let Some(controller) = devices.get_controller(hand) else {
